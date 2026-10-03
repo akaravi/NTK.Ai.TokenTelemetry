@@ -51,8 +51,6 @@ feature/
 cache/
 
 # --- Graphify (knowledge graph build artifacts) ---
-graphify-out/
-**/graphify-out/
 GRAPH_REPORT.md
 
 # Agent worktrees (live git worktrees, never commit)
@@ -72,3 +70,17 @@ pr.diff
 simulate.py
 .grok/
 dist/
+# Graphify local knowledge graph
+graphify-out/
+**/graphify-out/
+
+# --- karavi ---
+karavi/karavi.temp.logs/
+karavi/karavi.temp.status/
+karavi/karavi.temp.deploy/
+karavi/karavi.temp.build/
+karavi/karavi.deploy.config/Deploy_FTP.info
+karavi/karavi.deploy.config/Deploy_TestUsers.info
+karavi/karavi.deploy.config/deploy.secrets.json
+.omp/
+.freebuff/
