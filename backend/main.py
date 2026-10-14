@@ -8,7 +8,7 @@ import json
 import yaml
 import sqlite3
 from pathlib import Path
-from typing import List, Optional, Dict, Any, Set, Iterable, Tuple
+from typing import Callable, List, Optional, Dict, Any, Set, Iterable, Tuple
 from pydantic import BaseModel
 from datetime import datetime, timezone, timedelta, time as _dtime
 from urllib.parse import unquote, quote
@@ -26,6 +26,7 @@ from quotas import (
     QuotaService, default_quota_providers,
 )
 import scan_cache
+import antigravity_usage
 import harness_panels
 import codex_goals
 import hermes_telemetry as _ht
@@ -1517,6 +1518,213 @@ def _antigravity_cli_meta(cli_dir: Path = ANTIGRAVITY_CLI_DIR) -> Dict[str, Dict
     for cid, ws in hist_project.items():
         meta.setdefault(cid, {}).setdefault("project", ws)
     return meta
+
+
+def _antigravity_store_meta() -> Dict[str, Dict[str, Any]]:
+    """`_antigravity_cli_meta` for every Antigravity store, not just the CLI's.
+
+    The IDE and the 2.0 app keep the same conversations/<id>.db trajectories, so
+    their sessions have the same exact model and project available. Reading only
+    the CLI store left IDE/app sessions to the brain-text heuristic, which is how
+    a screenshot path ended up as one session's project. The CLI's record wins
+    where a session somehow appears in more than one store.
+    """
+    merged: Dict[str, Dict[str, Any]] = {}
+    for brain_dir, _surface in ANTIGRAVITY_BRAIN_SOURCES:
+        for sid, entry in _antigravity_cli_meta(brain_dir.parent).items():
+            slot = merged.setdefault(sid, {})
+            for key, value in entry.items():
+                slot.setdefault(key, value)
+    return merged
+
+
+def _antigravity_price_known(model: str) -> bool:
+    """Whether the pricing table holds this exact model id.
+
+    Deliberately not calculate_cost's fuzzy match: a bare "gemini" key matches
+    every Gemini name, so an id that is really an internal alias would look priced
+    at a generic rate. See antigravity_usage.canonical_model.
+    """
+    import pricing as _pricing
+    norm = _pricing._normalize_model_id(model)
+    return bool(_pricing.rates_for(norm) or _pricing.PRICING.get(norm))
+
+
+def _antigravity_price(model: str, inp: int, out: int, cached: int, day: str) -> float:
+    # `day` prices each bucket at the rate in force when its calls ran.
+    return calculate_cost(model, inp, out, cached, at=day)
+
+
+def _antigravity_real_usage(db: Path) -> Optional[Dict[str, Any]]:
+    """Real token accounting for one conversation, via the scan cache.
+
+    Decoding every generation row of ~100 databases on each scan would be the
+    slowest part of it, and the rows only change while a session runs. The cache
+    is keyed on the newest write to the .db or its WAL, and stores raw token
+    buckets rather than a cost, so a pricing update applies without invalidating
+    it.
+
+    Returns the ``summarize`` result plus ``first_ts``/``last_ts`` (datetimes),
+    or None when the file holds no decodable model calls.
+    """
+    mtime = antigravity_usage.source_mtime(db)
+    cached = scan_cache.read_cache("antigravity", db.stem, mtime)
+    if cached is not None and cached.get("path") == str(db):
+        usage = cached.get("usage")
+    else:
+        usage = antigravity_usage.read_usage(db)
+        scan_cache.write_cache("antigravity", db.stem, mtime, {"path": str(db), "usage": usage})
+    if not usage or not usage.get("calls"):
+        return None
+    result = antigravity_usage.summarize(usage, _antigravity_price, _antigravity_price_known)
+    for key in ("first_ts", "last_ts"):
+        seconds = usage.get(key)
+        result[key] = datetime.fromtimestamp(seconds, tz=timezone.utc) if seconds else None
+    result["calls"] = usage.get("calls", 0)
+    return result
+
+
+def _antigravity_summary_index() -> Dict[str, Dict[str, Any]]:
+    """Antigravity's own session index, from each store's conversation_summaries.db.
+
+    It lists every conversation the app knows about with its title, last activity
+    and workspace, including sessions whose brain/ folder never received a
+    transcript. It is the one record that covers older .pb sessions, whose token
+    usage is not recorded anywhere we can read.
+    """
+    index: Dict[str, Dict[str, Any]] = {}
+    gemini_home = str(GEMINI_DIR)
+    for brain_dir, surface in ANTIGRAVITY_BRAIN_SOURCES:
+        db = brain_dir.parent / "conversation_summaries.db"
+        if not db.exists():
+            continue
+        try:
+            con = sqlite3.connect(_sqlite_ro_uri(db), uri=True)
+            try:
+                rows = con.execute(
+                    "SELECT conversation_id, title, preview, step_count, workspace_uris, "
+                    "last_modified_time FROM conversation_summaries").fetchall()
+            finally:
+                con.close()
+        except (sqlite3.Error, OSError):
+            continue
+        for cid, title, preview, steps, uris, modified in rows:
+            if not cid or cid in index:
+                continue
+            workspace = None
+            try:
+                parsed = json.loads(uris) if uris else []
+            except (TypeError, ValueError):
+                parsed = []
+            for uri in parsed if isinstance(parsed, list) else []:
+                path = unquote(str(uri).split("://", 1)[-1]) if "://" in str(uri) else str(uri)
+                # Scratch playgrounds under ~/.gemini are the agent's own space.
+                if path and not path.startswith(gemini_home):
+                    workspace = path.rstrip("/")
+                    break
+            try:
+                when = _aware(datetime.fromisoformat(str(modified).replace("Z", "+00:00"))) if modified else None
+            except ValueError:
+                when = None
+            index[cid] = {"title": (title or preview or "").strip(), "steps": steps or 0,
+                          "workspace": workspace, "timestamp": when, "surface": surface}
+    return index
+
+
+_AG_STORE_SURFACE = {"antigravity-cli": "cli", "antigravity-ide": "ide", "antigravity": "app"}
+
+
+def _antigravity_apply_real_usage(
+    sessions: List[Dict[str, Any]],
+    seen: set,
+    meta: Dict[str, Dict[str, Any]],
+    surfaces: Dict[str, str],
+    alias: Callable[[str], str],
+) -> None:
+    """Replace estimated Antigravity numbers with recorded ones, and add the
+    sessions the brain/ scan cannot see.
+
+    ``alias`` is the scan's own project-alias lookup (a closure over the aliases
+    it loaded), not the module-level ``apply_alias``, which takes them as a
+    second argument.
+
+    1. Every Antigravity session already collected whose conversations/<id>.db
+       records model calls takes its tokens, cost, model and last-activity time
+       from those records. Before this, the brain/ path estimated tokens as
+       characters / 4 and hard-coded the cost to $0.
+    2. A conversation with recorded calls but no usable brain/ folder is added
+       from its database.
+    3. A conversation Antigravity's own index lists with steps, and no database,
+       is added from the index: an older .pb session. Its tokens are unknown and
+       reported as zero rather than guessed.
+    """
+    db_files = antigravity_usage.conversation_files(GEMINI_DIR)
+    by_id = {s["id"]: s for s in sessions if s.get("agent") == "antigravity"}
+    index = _antigravity_summary_index()
+
+    def _project(sid: str, fallback: str = ANTIGRAVITY_UNASSIGNED) -> str:
+        found = (meta.get(sid) or {}).get("project") or (index.get(sid) or {}).get("workspace")
+        return alias(found or fallback)
+
+    for sid, db in db_files.items():
+        try:
+            real = _antigravity_real_usage(db)
+        except Exception as exc:  # one bad database must not cost the whole scan
+            _ag_log_warn("antigravity usage read failed for %s: %s", db.name, exc)
+            continue
+        if real is None:
+            continue
+        existing = by_id.get(sid)
+        if existing is not None:
+            existing["tokens"] = real["tokens"]
+            existing["cost"] = real["cost"]
+            existing["model"] = real["model"] or existing.get("model")
+            if real["last_ts"]:
+                existing["timestamp"] = real["last_ts"]
+            if existing.get("project") in (None, "", ANTIGRAVITY_UNASSIGNED):
+                existing["project"] = _project(sid)
+            continue
+        if sid in seen:
+            continue  # already reported under another agent (e.g. the Gemini CLI path)
+        seen.add(sid)
+        entry = index.get(sid) or {}
+        session = {
+            "id": sid,
+            "agent": "antigravity",
+            "project": _project(sid),
+            "timestamp": real["last_ts"] or entry.get("timestamp") or _file_mtime_utc(db),
+            "display": _antigravity_first_prompt(sid, entry.get("title", "")),
+            "tokens": real["tokens"],
+            "mcp_tools": [],
+            "has_plan": False,
+            "plans": [],
+            "model": real["model"],
+            "artifacts": [],
+            "antigravity_source": surfaces.get(sid) or _AG_STORE_SURFACE.get(db.parent.parent.name),
+            "cost": real["cost"],
+        }
+        sessions.append(session)
+        by_id[sid] = session
+
+    for sid, entry in index.items():
+        if sid in by_id or sid in seen or sid in db_files or not entry.get("steps"):
+            continue
+        seen.add(sid)
+        sessions.append({
+            "id": sid,
+            "agent": "antigravity",
+            "project": _project(sid),
+            "timestamp": entry.get("timestamp") or _now(),
+            "display": _antigravity_first_prompt(sid, entry.get("title", "")),
+            "tokens": {"input": 0, "output": 0, "cached": 0, "total": 0, "cost": 0.0},
+            "mcp_tools": [],
+            "has_plan": False,
+            "plans": [],
+            "model": None,
+            "artifacts": [],
+            "antigravity_source": surfaces.get(sid) or entry.get("surface"),
+            "cost": 0.0,
+        })
 
 class TokenUsage(BaseModel):
     input: int = 0
@@ -8133,6 +8341,15 @@ def _scan_sessions_sync():
         sessions.extend(codex_sessions.values())
 
     # 3 & 7. Gemini & Antigravity
+    # Both are read by the Antigravity passes below, so they are set here rather
+    # than inside the Gemini branch. They used to be assigned only once
+    # ~/.gemini/projects.json was found, and that file belongs to the Gemini CLI,
+    # not Antigravity. On a machine with Antigravity but no Gemini CLI history,
+    # the brain/ loop's first `sid in _seen_antigravity` raised NameError, its
+    # per-session `except Exception: continue` swallowed it, and every Antigravity
+    # session was dropped without a trace.
+    _ag_surface = _antigravity_surface_map()  # session id → cli/ide/app, for sub-labels
+    _seen_antigravity: set = set()  # global dedup across chat + logs + brain; first discovery wins (ensures real token versions from tmp preferred over brain estimates; kills intra-tmp chat dupes for same sid)
     gemini_projects_file = GEMINI_DIR / "projects.json"
     if gemini_projects_file.exists():
         try:
@@ -8169,8 +8386,6 @@ def _scan_sessions_sync():
                             if _d and _d.get("sessionId"):
                                 _all_chat_sids.add(_d["sessionId"])
                         except Exception: pass
-            _ag_surface = _antigravity_surface_map()  # session id → cli/ide/app, for sub-labels
-            _seen_antigravity: set = set()  # global dedup across chat + logs + brain; first discovery wins (ensures real token versions from tmp preferred over brain estimates; kills intra-tmp chat dupes for same sid)
 
             for tmp_dir in (GEMINI_DIR / "tmp").glob("*"):
                 if not tmp_dir.is_dir(): continue
@@ -8309,8 +8524,9 @@ def _scan_sessions_sync():
 
     # 3b. Antigravity brain/ folder — richer per-session artifacts (task/plan/walkthrough)
     _seen_brain_sids: set = set()
-    # CLI (`agy`) ground truth: real model + exact project, keyed by session id.
-    _ag_cli_meta = _antigravity_cli_meta()
+    # Ground truth from each store's SQLite trajectories: real model + exact
+    # project, keyed by session id, for the IDE and app as well as the CLI.
+    _ag_cli_meta = _antigravity_store_meta()
     for _brain_dir in ANTIGRAVITY_BRAIN_DIRS:
         if not _brain_dir.exists(): continue
         for sess_dir in _brain_dir.iterdir():
@@ -8441,6 +8657,13 @@ def _scan_sessions_sync():
                     **({"published_artifacts": doc_arts} if doc_arts else {}),
                 })
             except Exception: continue
+
+    # 3c. Recorded usage from each conversation's own SQLite store, and the
+    # sessions brain/ has no folder for. See _antigravity_apply_real_usage.
+    try:
+        _antigravity_apply_real_usage(sessions, _seen_antigravity, _ag_cli_meta, _ag_surface, apply_alias)
+    except Exception as exc:
+        _ag_log_warn("antigravity real-usage pass failed: %s", exc)
 
     # 4. Qwen
     if QWEN_DIR.exists():
@@ -11295,6 +11518,12 @@ async def post_telemetry_event(payload: dict = Body(...)):
         return {"ok": False}
     props = payload.get("props")
     _telemetry.emit(event, props if isinstance(props, dict) else None)
+    # Recurring-user signal, WITHOUT any install id: a real UI event reached
+    # this bridge, so mark today active. Deliberately not on app.launched/
+    # startup -- that would also count headless/bot launches. mark_active()
+    # emits "app.active" itself, at most once per local calendar day; it is
+    # a no-op unless telemetry is enabled and never raises.
+    _telemetry.mark_active()
     return {"ok": True}
 
 
@@ -13132,7 +13361,7 @@ async def make_summary(session_id: str, agent: str, force: bool = False):
         sm = get_summarizer(backend_name, cfg.get("model"), cfg.get("openai_compat"))
         if sm and sm.is_available():
             try:
-                raw = sm.summarize(_summaries.build_prompt(brief))
+                raw = await _asyncio.to_thread(sm.summarize, _summaries.build_prompt(brief))
                 narrative = _summaries.parse_narrative(raw)
             except SummarizerError as e:
                 gen_error = str(e)
@@ -13180,6 +13409,143 @@ async def make_summary(session_id: str, agent: str, force: bool = False):
         "error": gen_error,
         "error_info": error_info,
     }
+
+@app.get("/sessions/{session_id}/summary/custom")
+async def list_custom_summaries(session_id: str, agent: str = ""):
+    """Stored custom answers. With ``agent`` given, each item also carries
+    ``stale``: whether the trace has changed since the answer was made."""
+    items = _summaries.list_custom(session_id)
+    if agent:
+        try:
+            detail = await get_session_detail(session_id, agent)
+            events = [] if (isinstance(detail, dict) and detail.get("error")) else _summaries.normalize_detail(detail)
+        except Exception:
+            events = []
+        if events:
+            chash = _summaries.content_hash(session_id, events)
+            items = [{**it, "stale": it["content_hash"] != chash} for it in items]
+    return {"items": items}
+
+@app.post("/sessions/{session_id}/summary/custom")
+async def make_custom_summary(session_id: str, agent: str, body: dict = Body(...)):
+    """Run a user-written prompt over the session brief with the configured
+    summarizer backend. Answers are cached per (session, prompt) and replaced
+    when the trace has grown or the backend or model changed."""
+    prompt = _summaries.clean_custom_prompt(body.get("prompt"))
+    if not prompt:
+        raise HTTPException(status_code=422, detail="prompt is required")
+    cfg = _summaries.load_config()
+    backend_name = cfg.get("backend")
+    if not (cfg.get("enabled") and backend_name):
+        raise HTTPException(status_code=409, detail="AI summaries are off; enable a summarizer backend in settings")
+
+    detail = await get_session_detail(session_id, agent)
+    if isinstance(detail, dict) and detail.get("error"):
+        raise HTTPException(status_code=404, detail=detail.get("error", "session not found"))
+    events = _summaries.normalize_detail(detail)
+    if not events:
+        raise HTTPException(status_code=422, detail="no trace content to summarize")
+
+    chash = _summaries.content_hash(session_id, events)
+    phash = _summaries.prompt_hash(prompt)
+    if not body.get("force"):
+        hit = _summaries.get_custom(session_id, phash)
+        if (
+            hit and hit["content_hash"] == chash
+            and hit["backend"] == backend_name and hit["model"] == cfg.get("model")
+        ):
+            return {"item": hit, "cached": True, "error": None, "error_info": None}
+
+    meta = await _session_meta(session_id, agent) or {"agent": agent}
+    brief = _summaries.condense_for_focus(events, meta)
+    gen_error = None
+    answer = None
+    sm = get_summarizer(backend_name, cfg.get("model"), cfg.get("openai_compat"))
+    if sm and sm.is_available():
+        try:
+            # Blocking subprocess or HTTP call: keep it off the event loop.
+            answer = await _asyncio.to_thread(
+                _summaries.ask_untrusted, sm, _summaries.build_custom_prompt(brief, prompt)
+            )
+        except SummarizerError as e:
+            gen_error = str(e)
+    else:
+        gen_error = f"summarizer '{backend_name}' is not available"
+
+    if not answer and not gen_error:
+        gen_error = f"{backend_name} produced no output"
+    item = None
+    error_info = None
+    persisted = True
+    if answer:
+        try:
+            item = _summaries.store_custom(session_id, prompt, chash, backend_name, cfg.get("model"), answer)
+        except sqlite3.Error:
+            # The model call already ran (and may have spent quota), so hand
+            # the answer back even though it could not be saved.
+            persisted = False
+            item = {
+                "prompt_hash": phash, "prompt": prompt, "content_hash": chash,
+                "backend": backend_name, "model": cfg.get("model"), "answer": answer,
+                "generated_at": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
+            }
+    elif gen_error:
+        from summarizers.errors import classify as _classify_err
+        error_info = _classify_err(gen_error, backend_name=backend_name or "")
+    return {"item": item, "cached": False, "error": gen_error, "error_info": error_info, "persisted": persisted}
+
+@app.post("/sessions/{session_id}/chat")
+async def chat_about_session(session_id: str, agent: str, body: dict = Body(...)):
+    """One turn of a chat about a single session. The client sends the whole
+    conversation each time and nothing is stored here. The transcript is
+    searched for the excerpts that match the latest question and those are sent
+    with the standard brief and the conversation."""
+    try:
+        messages = _summaries.clean_chat_messages(body.get("messages"))
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    cfg = _summaries.load_config()
+    backend_name = cfg.get("backend")
+    if not (cfg.get("enabled") and backend_name):
+        raise HTTPException(status_code=409, detail="AI summaries are off; enable a summarizer backend in settings")
+
+    detail = await get_session_detail(session_id, agent)
+    if isinstance(detail, dict) and detail.get("error"):
+        raise HTTPException(status_code=404, detail=detail.get("error", "session not found"))
+    events = _summaries.normalize_detail(detail)
+    if not events:
+        raise HTTPException(status_code=422, detail="no trace content to chat about")
+
+    meta = await _session_meta(session_id, agent) or {"agent": agent}
+    brief = _summaries.condense_trace(events, meta)
+    snippets = _summaries.retrieve_snippets(_summaries.build_chunks(events), messages[-1]["content"])
+    prompt = _summaries.build_chat_prompt(brief, snippets, messages)
+
+    gen_error = None
+    answer = None
+    sm = get_summarizer(backend_name, cfg.get("model"), cfg.get("openai_compat"))
+    if sm and sm.is_available():
+        try:
+            answer = await _asyncio.to_thread(_summaries.ask_untrusted, sm, prompt)
+        except SummarizerError as e:
+            gen_error = str(e)
+    else:
+        gen_error = f"summarizer '{backend_name}' is not available"
+    if not answer and not gen_error:
+        gen_error = f"{backend_name} produced no output"
+
+    reply = None
+    error_info = None
+    if answer:
+        reply = {
+            "role": "assistant", "content": answer, "backend": backend_name,
+            "model": cfg.get("model"), "excerpts": len(snippets),
+            "generated_at": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
+        }
+    else:
+        from summarizers.errors import classify as _classify_err
+        error_info = _classify_err(gen_error, backend_name=backend_name or "")
+    return {"reply": reply, "error": gen_error, "error_info": error_info}
 
 @app.post("/summaries/recent")
 async def summarize_recent(limit: int = 20):
@@ -13229,7 +13595,7 @@ if __name__ == "__main__":
 
     logging.getLogger("uvicorn.access").addFilter(_TokenRedactingFilter())
 
-    # Port resolution order: --port CLI arg → TT_API_PORT env var → 8000.
+    # Port resolution order: --port CLI arg → TT_API_PORT env var → 18000.
     # bin/cli.js passes --port; running the file directly (uvicorn / python)
     # honors the env var so devs can override without editing args.
     def _resolve_port() -> int:
@@ -13245,7 +13611,7 @@ if __name__ == "__main__":
         if env_port:
             try: return int(env_port)
             except ValueError: pass
-        return 8000
+        return 18000
 
     # Host resolution order: --host CLI arg → TT_HOST env var → 127.0.0.1.
     # Default stays loopback; set 0.0.0.0 (or a specific interface IP) to expose
