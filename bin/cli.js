@@ -708,7 +708,7 @@ async function start(options) {
 
   // Auto-launch the dashboard once Next.js is actually responding.
   waitForHttp(dashUrl).then((ok) => {
-    if (ok) {
+    if (ok && !noOpen) {
       console.log('→ opening dashboard in your browser…');
       openBrowser(dashUrl, options);
     }
